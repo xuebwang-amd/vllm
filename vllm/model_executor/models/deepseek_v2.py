@@ -1341,10 +1341,6 @@ class DeepseekV2ForCausalLM(
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
-                # Skip shared_experts unconditionally - they don't use stacked params
-                # and will be handled in the non-expert section
-                if "shared_experts" in name:
-                    continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
                 # we need to skip here BEFORE we update the name, otherwise
@@ -1366,13 +1362,6 @@ class DeepseekV2ForCausalLM(
                     continue
                 else:
                     name = name_mapped
-                
-                # Handle weight_scale_inv -> weight_scale remapping for shared_experts
-                if "shared_experts" in name and "weight_scale_inv" in name and name not in params_dict:
-                    alternative_name = name.replace("weight_scale_inv", "weight_scale")
-                    if alternative_name in params_dict:
-                        name = alternative_name
-                
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1381,66 +1370,8 @@ class DeepseekV2ForCausalLM(
                     continue
 
                 param = params_dict[name]
-                
-                # Apply dimension conversion for weights and scales before loading
-                # This applies to attention weights (fused_qkv) and other merged weights
-                # But NOT to shared_experts which have different structure
-                # gate_up_proj.weight: needs dimension 1 downsampling (7168 -> 3584)
-                # gate_up_proj.weight_scale: needs dimension expansion and downsampling
-                # down_proj.weight: needs dimension 1 downsampling (2048 -> 1024)
-                # fused_qkv_a_proj.weight: needs dimension 1 downsampling (7168 -> 3584)
-                if ("shared_experts" not in name and 
-                    ("gate_up_proj" in name or "gate_proj" in name or 
-                     "up_proj" in name or "down_proj" in name or
-                     "fused_qkv" in name or "qkv" in name)):
-                    if loaded_weight.ndim >= 2:
-                        tp_size = get_tensor_model_parallel_world_size()
-                        
-                        # For scales, apply dimension 0 and dimension 1 expansion first
-                        if "scale" in name:
-                            # Dimension 0 expansion (grouped scales to full size)
-                            param_dim0 = param.data.shape[0]
-                            loaded_dim0 = loaded_weight.shape[0]
-                            if loaded_dim0 < param_dim0 and (param_dim0 % loaded_dim0 == 0):
-                                dim0_ratio = param_dim0 // loaded_dim0
-                                loaded_weight = loaded_weight.repeat_interleave(dim0_ratio, dim=0).contiguous()
-                            
-                            # Dimension 1 expansion (block size conversion)
-                            # For column-parallel scales, dim 1 is NOT sharded, so target per-rank size
-                            # Only process if param is 2D and loaded_weight is also 2D
-                            if param.data.ndim > 1 and loaded_weight.ndim > 1:
-                                expected_dim1_per_rank = param.data.shape[1]
-                                actual_dim1 = loaded_weight.shape[1]
-                                
-                                if actual_dim1 < expected_dim1_per_rank and (expected_dim1_per_rank % actual_dim1 == 0):
-                                    dim1_ratio = expected_dim1_per_rank // actual_dim1
-                                    loaded_weight = loaded_weight.repeat_interleave(dim1_ratio, dim=1).contiguous()
-                        
-                        # Check if dimension 1 needs downsampling (for both weights and scales)
-                        # Note: param.data.shape is already per-TP-rank, don't multiply by tp_size
-                        # Only process if both param and loaded_weight are 2D
-                        # Skip for shared_experts as they have different structure
-                        if "shared_experts" not in name and param.data.ndim > 1 and loaded_weight.ndim > 1:
-                            expected_dim1_per_rank = param.data.shape[1]
-                            expected_dim1_total = expected_dim1_per_rank * tp_size
-                            actual_dim1 = loaded_weight.shape[1]
-                            
-                            # For shared_experts, the checkpoint has full hidden dimension
-                            # After 2x downsampling, it should match expected_per_rank * tp_size
-                            # But load_merged_column_weight will handle TP sharding, so we just need
-                            # to ensure after downsampling: actual / 2 == expected_total
-                            if actual_dim1 == expected_dim1_per_rank * 2:
-                                # Checkpoint has 2x the per-rank dimension (before TP sharding)
-                                # After downsampling, load_merged_column_weight will shard it
-                                loaded_weight = loaded_weight[:, ::2].contiguous()
-                
                 weight_loader = param.weight_loader
-                
-                # For scales that already match param shape exactly, bypass narrowing and directly copy
-                if "scale" in name and loaded_weight.shape == param.data.shape:
-                    param.data.copy_(loaded_weight)
-                else:
-                    weight_loader(param, loaded_weight, shard_id)
+                weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 is_expert_weight = False
@@ -1509,257 +1440,13 @@ class DeepseekV2ForCausalLM(
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
 
-                        # Handle weight_scale_inv -> weight_scale remapping for MoE experts
-                        # This is needed when loading checkpoints with different quantization naming
-                        if name_mapped not in params_dict and "weight_scale_inv" in name_mapped:
-                            alternative_name = name_mapped.replace("weight_scale_inv", "weight_scale")
-                            if alternative_name in params_dict:
-                                name_mapped = alternative_name
-                                # logger.info_once(
-                                #     f"Remapping {chunk_name} -> {name_mapped} for weight loading"
-                                # )
-                        
-                        # Skip if parameter not found (may be on another rank due to EP)
-                        if name_mapped not in params_dict:
-                            continue
-
                         param = params_dict[name_mapped]
-                        
-                        # Pre-process weight tensors and weight_scale tensors for MXFP4 quantization
-                        # Handle dimension mismatches for both weights and scales
-                        # Apply conversion for both weight and weight_scale tensors
-                        # Check for MoE expert weights: w2 (down_proj), w13 (gate_proj/up_proj), gate_up_proj, or any weight with dimension >= 2
-                        # Skip shared_experts - they have different structure (PTPC FP8)
-                        is_moe_weight = (
-                            "shared_experts" not in name and  # Original name, not chunk_name
-                            ("scale" in chunk_name or "weight" in chunk_name) and 
-                            weight_to_load.ndim >= 2 and
-                            (shard_id in ["w2", "w13", "w1", "w3"] or  # Explicit shard IDs
-                             "down_proj" in chunk_name or  # w2
-                             "gate_proj" in chunk_name or  # w1/w13
-                             "up_proj" in chunk_name or    # w3/w13
-                             "gate_up_proj" in chunk_name) # Merged column-parallel for shared experts
-                        )
-                        
-                        if is_moe_weight:
-                            original_shape = weight_to_load.shape
-                            tp_size = get_tensor_model_parallel_world_size()
-                            block_size = 32  # OCP_MX_BLOCK_SIZE for MXFP4
-                            
-                            # Determine expected dimension based on parameter shape and weight type
-                            if hasattr(param, 'data'):
-                                # Try to get param shape - handle both full tensor and per-expert indexing
-                                try:
-                                    if expert_id == -1 or param.data.ndim <= 2:
-                                        # Full tensor or 2D tensor (no expert dimension)
-                                        if shard_id == "w2" or "down_proj" in chunk_name:
-                                            # For w2/down_proj: param shape is (hidden_size, intermediate_size_per_rank)
-                                            # Check dimension 1 (intermediate_size dimension)
-                                            param_shard_dim = param.data.shape[1] if param.data.ndim > 1 else param.data.shape[-1]
-                                        else:  # w13, w1, w3, gate_proj, up_proj, gate_up_proj
-                                            # For w13/gate_proj/up_proj/gate_up_proj: param shape is (2*intermediate_size_per_rank, hidden_size) or (intermediate_size_per_rank, hidden_size)
-                                            # Check dimension 0 (intermediate_size dimension)
-                                            param_shard_dim = param.data.shape[0] if param.data.ndim > 1 else param.data.shape[-1]
-                                    else:
-                                        # Per-expert tensor (3D+)
-                                        if shard_id == "w2" or "down_proj" in chunk_name:
-                                            param_shard_dim = param.data[expert_id].shape[1] if param.data[expert_id].ndim > 1 else param.data[expert_id].shape[-1]
-                                        else:  # w13, w1, w3, gate_up_proj
-                                            param_shard_dim = param.data[expert_id].shape[0] if param.data[expert_id].ndim > 1 else param.data[expert_id].shape[-1]
-                                except (IndexError, TypeError) as e:
-                                    logger.warning_once(
-                                        f"Could not get param shape for {chunk_name}, expert_id={expert_id}: {e}. "
-                                        f"param.data.shape={param.data.shape}"
-                                    )
-                                    param_shard_dim = None
-                                
-                                if param_shard_dim is not None:
-                                    expected_total_dim = param_shard_dim * tp_size
-                                    # For w2/down_proj, check dimension 1 (intermediate_size dimension)
-                                    # For w13/gate_proj/up_proj/gate_up_proj, check dimension 0 (intermediate_size dimension)
-                                    if shard_id == "w2" or "down_proj" in chunk_name:
-                                        actual_dim = weight_to_load.shape[1] if weight_to_load.ndim > 1 else weight_to_load.shape[-1]
-                                    else:  # w13, w1, w3, gate_proj, up_proj, gate_up_proj
-                                        actual_dim = weight_to_load.shape[0] if weight_to_load.ndim > 1 else weight_to_load.shape[-1]
-                                    
-                                    # Special handling for scales with dimension mismatch
-                                    # Check if this is a compressed/grouped scale format that needs expansion
-                                    if "scale" in chunk_name and expected_total_dim > actual_dim:
-                                        # The scale might be in a compressed format [56, 16] instead of [7168, 64]
-                                        # Check if we need to expand/reshape it
-                                        dim0_ratio = param.data.shape[0] // weight_to_load.shape[0] if param.data.shape[0] != weight_to_load.shape[0] else 1
-                                        dim1_expansion_needed = expected_total_dim // actual_dim if expected_total_dim % actual_dim == 0 else 1
-                                        
-                                        # Try transposing if dimensions seem swapped
-                                        if (weight_to_load.shape[0] == expected_total_dim and 
-                                            weight_to_load.shape[1] * dim0_ratio == param.data.shape[0]):
-                                            weight_to_load = weight_to_load.T.contiguous()
-                                            actual_dim = weight_to_load.shape[1]
-                                    
-                                    # Apply conversion if dimension mismatch detected
-                                    conversion_applied = False
-                                    
-                                    # Handle dimension 0 expansion for scales (from grouped to per-element format)
-                                    # For w2_weight_scale: param.data can be 3D [num_experts, hidden_size, blocks] or 2D [hidden_size, blocks]
-                                    # For w13_weight_scale: param.data can be 3D [num_experts, intermediate_size, hidden_blocks] or 2D [intermediate_size, hidden_blocks]
-                                    # We need to match the first dimension
-                                    if "scale" in chunk_name:
-                                        # Get target dim0 from param - handle both 2D and 3D cases
-                                        if param.data.ndim == 3 and expert_id != -1:
-                                            # 3D param, per-expert: target is param.data[expert_id].shape[0]
-                                            target_dim0 = param.data[expert_id].shape[0] if expert_id >= 0 else param.data.shape[1]
-                                        elif param.data.ndim == 3:
-                                            # 3D param, full load: target is param.data.shape[1]
-                                            target_dim0 = param.data.shape[1]
-                                        else:
-                                            # 2D param: target is param.data.shape[0]
-                                            target_dim0 = param.data.shape[0]
-                                        
-                                        # Expand dimension 0 if needed
-                                        if weight_to_load.shape[0] != target_dim0:
-                                            dim0_ratio = target_dim0 // weight_to_load.shape[0]
-                                            if target_dim0 == weight_to_load.shape[0] * dim0_ratio:
-                                                # Expand dimension 0 by repeating each row
-                                                weight_to_load = weight_to_load.repeat_interleave(dim0_ratio, dim=0).contiguous()
-                                                conversion_applied = True
-                                                # Recalculate actual_dim after potential expansion
-                                                if shard_id == "w2" or "down_proj" in chunk_name:
-                                                    actual_dim = weight_to_load.shape[1] if weight_to_load.ndim > 1 else weight_to_load.shape[-1]
-                                                else:
-                                                    actual_dim = weight_to_load.shape[0] if weight_to_load.ndim > 1 else weight_to_load.shape[-1]
-                                        
-                                        # For w13 scales (including gate_up_proj), also check dimension 1 (hidden blocks) expansion
-                                        # This handles the case where checkpoint uses different block size (e.g., 128 vs 32)
-                                        if shard_id in ["w1", "w3"] or "gate_proj" in chunk_name or "up_proj" in chunk_name or "gate_up_proj" in chunk_name:
-                                            # Get target dim1 for w13 scales
-                                            if param.data.ndim == 3 and expert_id != -1:
-                                                target_dim1 = param.data[expert_id].shape[1] if expert_id >= 0 else param.data.shape[2]
-                                            elif param.data.ndim == 3:
-                                                target_dim1 = param.data.shape[2]
-                                            else:
-                                                target_dim1 = param.data.shape[1]
-                                            
-                                            if weight_to_load.shape[1] != target_dim1:
-                                                dim1_ratio = target_dim1 // weight_to_load.shape[1]
-                                                if target_dim1 == weight_to_load.shape[1] * dim1_ratio:
-                                                    # Expand dimension 1 by repeating each column
-                                                    weight_to_load = weight_to_load.repeat_interleave(dim1_ratio, dim=1).contiguous()
-                                                    conversion_applied = True
-                                        
-                                        # For w2 scales (down_proj), also check dimension 1 (intermediate blocks) expansion
-                                        # This handles different TP sizes requiring different total dimensions
-                                        elif shard_id == "w2" or "down_proj" in chunk_name:
-                                            # Get target dim1 for w2 scales (total blocks across all ranks)
-                                            if param.data.ndim == 3 and expert_id != -1:
-                                                target_dim1_per_rank = param.data[expert_id].shape[1] if expert_id >= 0 else param.data.shape[2]
-                                            elif param.data.ndim == 3:
-                                                target_dim1_per_rank = param.data.shape[2]
-                                            else:
-                                                target_dim1_per_rank = param.data.shape[1]
-                                            
-                                            # For w2, the total dimension should be target_dim1_per_rank * tp_size
-                                            target_dim1_total = target_dim1_per_rank * tp_size
-                                            
-                                            if weight_to_load.shape[1] != target_dim1_total:
-                                                dim1_ratio = target_dim1_total // weight_to_load.shape[1]
-                                                if target_dim1_total == weight_to_load.shape[1] * dim1_ratio:
-                                                    # Expand dimension 1 by repeating each column
-                                                    weight_to_load = weight_to_load.repeat_interleave(dim1_ratio, dim=1).contiguous()
-                                                    conversion_applied = True
-                                                    # Recalculate actual_dim after expansion
-                                                    actual_dim = weight_to_load.shape[1]
-                                    
-                                    if actual_dim == expected_total_dim * block_size:
-                                        # Per-element to per-block conversion (for scales)
-                                        # Determine which dimension to downsample
-                                        is_w2 = shard_id == "w2" or "down_proj" in chunk_name
-                                        
-                                        if len(weight_to_load.shape) == 2:
-                                            if is_w2:
-                                                weight_to_load = weight_to_load[:, ::block_size].contiguous()
-                                            else:  # w13 - downsample dim 0
-                                                weight_to_load = weight_to_load[::block_size, :].contiguous()
-                                        elif len(weight_to_load.shape) == 3:
-                                            if is_w2:
-                                                weight_to_load = weight_to_load[:, :, ::block_size].contiguous()
-                                            else:  # w13 - downsample dim 1
-                                                weight_to_load = weight_to_load[:, ::block_size, :].contiguous()
-                                        conversion_applied = True
-                                    elif actual_dim == expected_total_dim * 2 or (actual_dim * 4 == expected_total_dim and "scale" in chunk_name):
-                                        # 2x dimension mismatch for weights, or 4x for scales (16 vs 64, but we want 16 vs 32 after accounting for scale grouping)
-                                        # For scales: actual=16, expected_total=64, but since scale groups elements, 16*2=32 might be the right target
-                                        # Actually for scales after weight 2x conversion: 16 -> 8 (take every 2nd)
-                                        downsample_ratio = 2 if actual_dim == expected_total_dim * 2 else 2  # Always use 2x for now
-                                        is_w2 = shard_id == "w2" or "down_proj" in chunk_name
-                                        
-                                        if len(weight_to_load.shape) == 2:
-                                            if is_w2:
-                                                weight_to_load = weight_to_load[:, ::downsample_ratio].contiguous()
-                                            else:  # w13 - downsample dim 0
-                                                weight_to_load = weight_to_load[::downsample_ratio, :].contiguous()
-                                        elif len(weight_to_load.shape) == 3:
-                                            if is_w2:
-                                                weight_to_load = weight_to_load[:, :, ::downsample_ratio].contiguous()
-                                            else:  # w13 - downsample dim 1
-                                                weight_to_load = weight_to_load[:, ::downsample_ratio, :].contiguous()
-                                        conversion_applied = True
-                                        # Recalculate actual_dim after downsampling
-                                        if is_w2:
-                                            actual_dim = weight_to_load.shape[1] if weight_to_load.ndim > 1 else weight_to_load.shape[-1]
-                                        else:
-                                            actual_dim = weight_to_load.shape[0] if weight_to_load.ndim > 1 else weight_to_load.shape[-1]
-                                    elif actual_dim > expected_total_dim and (actual_dim % expected_total_dim == 0):
-                                        # Generic N-x dimension mismatch
-                                        ratio = actual_dim // expected_total_dim
-                                        is_w2 = shard_id == "w2" or "down_proj" in chunk_name
-                                        
-                                        if len(weight_to_load.shape) == 2:
-                                            if is_w2:
-                                                weight_to_load = weight_to_load[:, ::ratio].contiguous()
-                                            else:  # w13 - downsample dim 0
-                                                weight_to_load = weight_to_load[::ratio, :].contiguous()
-                                        elif len(weight_to_load.shape) == 3:
-                                            if is_w2:
-                                                weight_to_load = weight_to_load[:, :, ::ratio].contiguous()
-                                            else:  # w13 - downsample dim 1
-                                                weight_to_load = weight_to_load[:, ::ratio, :].contiguous()
-                                        conversion_applied = True
-                                    
-                                    # Final check: if actual_dim is still less than expected for WEIGHTS (not scales), expand
-                                    # For scales, after 2x downsampling, actual_dim should equal param_shard_dim (not expected_total_dim)
-                                    if "scale" not in chunk_name and actual_dim < expected_total_dim and (expected_total_dim % actual_dim == 0):
-                                        expand_ratio = expected_total_dim // actual_dim
-                                        is_w2 = shard_id == "w2" or "down_proj" in chunk_name
-                                        
-                                        # For w2/down_proj: expand dimension 1 (intermediate_size dimension)
-                                        # For w13/gate_proj/up_proj: expand dimension 0 (intermediate_size dimension)
-                                        if is_w2:
-                                            # Expand dimension 1 by repeating each column
-                                            if len(weight_to_load.shape) == 2:
-                                                weight_to_load = weight_to_load.repeat_interleave(expand_ratio, dim=1).contiguous()
-                                            elif len(weight_to_load.shape) == 3:
-                                                weight_to_load = weight_to_load.repeat_interleave(expand_ratio, dim=2).contiguous()
-                                        else:  # w13/w1/w3 weights
-                                            # Expand dimension 0 by repeating each row
-                                            if len(weight_to_load.shape) == 2:
-                                                weight_to_load = weight_to_load.repeat_interleave(expand_ratio, dim=0).contiguous()
-                                            elif len(weight_to_load.shape) == 3:
-                                                weight_to_load = weight_to_load.repeat_interleave(expand_ratio, dim=1).contiguous()
-                                        conversion_applied = True
-                        
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # other available replicas.
                         weight_loader = typing.cast(
                             Callable[..., bool], param.weight_loader
                         )
-                        # Debug: Log before expert weight_loader call
-                        if "shared_experts" in name:
-                            logger.warning_once(
-                                f"[EXPERT PATH LOAD] Original name={name}, chunk_name={chunk_name}, "
-                                f"name_mapped={name_mapped}, weight_to_load.shape={weight_to_load.shape}, "
-                                f"param.data.shape={param.data.shape}, expert_id={expert_id}, shard_id={shard_id}"
-                            )
                         success = weight_loader(
                             param,
                             weight_to_load,
@@ -1772,20 +1459,13 @@ class DeepseekV2ForCausalLM(
                             if not is_fusion_moe_shared_experts_layer:
                                 name = name_mapped
                             else:
-                                # Mark both mapped name and original name as loaded
-                                # to prevent re-processing in non-expert section
                                 loaded_params.add(name_mapped)
-                                loaded_params.add(name)
                             break
                     else:
                         if is_expert_weight:
                             # We've checked that this is an expert weight
                             # However it's not mapped locally to this rank
                             # So we simply skip it
-                            continue
-                        
-                        # Skip if this weight was already successfully loaded through expert path
-                        if name in loaded_params:
                             continue
 
                         # Skip loading extra bias for GPTQ models.
@@ -1797,278 +1477,14 @@ class DeepseekV2ForCausalLM(
                         if name is None:
                             continue
 
-                        # Handle weight_scale_inv -> weight_scale remapping
-                        # This is needed when loading checkpoints with different quantization naming
-                        if name not in params_dict and "weight_scale_inv" in name:
-                            alternative_name = name.replace("weight_scale_inv", "weight_scale")
-                            if alternative_name in params_dict:
-                                name = alternative_name
-
                         if is_pp_missing_parameter(name, self):
                             continue
 
-                        # Skip if parameter not found
-                        if name not in params_dict:
-                            continue
-
                         param = params_dict[name]
-                        
-                        # Pre-process weights and weight_scale tensors for MXFP4 quantization
-                        # Handle dimension mismatches for block quantization scales and weights
-                        # Skip preprocessing for shared_experts as they have different structure
-                        
-                        # Debug: Check if shared_experts weights are hitting MXFP4 preprocessing
-                        if "shared_experts" in name and "weight" in name and not "scale" in name:
-                            logger.warning_once(
-                                f"[DEBUG MXFP4 SKIP] Skipping MXFP4 preprocessing for {name}: "
-                                f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape}"
-                            )
-                        
-                        # First, handle dimension 0 and 1 downsampling for weights
-                        if "weight" in name and not "scale" in name and "shared_experts" not in name and loaded_weight.ndim >= 2:
-                            tp_size = get_tensor_model_parallel_world_size()
-                            if hasattr(param, 'data') and param.data.ndim >= 2:
-                                expected_dim0_per_rank = param.data.shape[0]
-                                expected_dim1_per_rank = param.data.shape[1]
-                                expected_dim0_total = expected_dim0_per_rank * tp_size
-                                expected_dim1_total = expected_dim1_per_rank * tp_size
-                                actual_dim0 = loaded_weight.shape[0]
-                                actual_dim1 = loaded_weight.shape[1]
-                                
-                                # Handle dimension 0 downsampling (2x or 4x for MXFP4, NOT for TP sharding)
-                                # Note: Do NOT manually shard for TP here - load_column_parallel_weight handles that
-                                if actual_dim0 == expected_dim0_per_rank * 4:
-                                    # 4x MXFP4 format at per-rank level (e.g., kv_b_proj)
-                                    loaded_weight = loaded_weight[::4, :].contiguous()
-                                elif actual_dim0 == expected_dim0_total * 4:
-                                    # 4x MXFP4 format at full dimension
-                                    loaded_weight = loaded_weight[::4, :].contiguous()
-                                elif actual_dim0 == expected_dim0_per_rank * 2:
-                                    # 2x MXFP4 format at per-rank level
-                                    loaded_weight = loaded_weight[::2, :].contiguous()
-                                elif actual_dim0 == expected_dim0_total * 2:
-                                    # 2x MXFP4 format at full dimension
-                                    loaded_weight = loaded_weight[::2, :].contiguous()
-                                # If actual_dim0 == expected_dim0_total (and > expected_dim0_per_rank), 
-                                # leave it as-is - load_column_parallel_weight will shard it
-                                
-                                # Handle dimension 1 downsampling (for column-parallel weights, dim 1 is NOT sharded)
-                                actual_dim1 = loaded_weight.shape[1]  # Re-read in case dim0 changed
-                                if actual_dim1 == expected_dim1_per_rank * 4:
-                                    loaded_weight = loaded_weight[:, ::4].contiguous()
-                                elif actual_dim1 == expected_dim1_total * 4:
-                                    loaded_weight = loaded_weight[:, ::4].contiguous()
-                                elif actual_dim1 == expected_dim1_per_rank * 2:
-                                    loaded_weight = loaded_weight[:, ::2].contiguous()
-                                elif actual_dim1 == expected_dim1_total * 2:
-                                    loaded_weight = loaded_weight[:, ::2].contiguous()
-                        
-                        # Skip scale preprocessing for shared_experts (except 2D handling done earlier)
-                        if "scale" in name and "shared_experts" not in name and loaded_weight.ndim >= 2:
-                            original_shape = loaded_weight.shape
-                            tp_size = get_tensor_model_parallel_world_size()
-                            block_size = 32  # OCP_MX_BLOCK_SIZE for MXFP4
-                            
-                            # First, handle dimension 0 expansion (grouped scales to full size)
-                            if hasattr(param, 'data'):
-                                try:
-                                    param_dim0 = param.data.shape[0]
-                                    loaded_dim0 = loaded_weight.shape[0]
-                                    
-                                    if loaded_dim0 < param_dim0 and (param_dim0 % loaded_dim0 == 0):
-                                        dim0_ratio = param_dim0 // loaded_dim0
-                                        loaded_weight = loaded_weight.repeat_interleave(dim0_ratio, dim=0).contiguous()
-                                except (IndexError, TypeError, AttributeError) as e:
-                                    logger.debug_once(f"Could not check dim0 for {name}: {e}")
-                            
-                            # Then, determine expected last dimension based on parameter shape
-                            if hasattr(param, 'data'):
-                                try:
-                                    param_last_dim = param.data.shape[-1]
-                                except (IndexError, TypeError) as e:
-                                    logger.warning_once(
-                                        f"Could not get param shape for {name}: {e}. "
-                                        f"param.data.shape={param.data.shape}"
-                                    )
-                                    param_last_dim = None
-                                
-                                if param_last_dim is not None:
-                                    # For column-parallel scales (output dim sharded, input blocks NOT sharded),
-                                    # the last dimension should match param directly, not multiplied by tp_size
-                                    # Check if dimension 0 is at per-rank size (indicates column-parallel)
-                                    param_dim0 = param.data.shape[0]
-                                    loaded_dim0 = loaded_weight.shape[0]
-                                    is_column_parallel_scale = (loaded_dim0 == param_dim0) or (loaded_dim0 < param_dim0 * tp_size)
-                                    
-                                    if is_column_parallel_scale:
-                                        expected_blocks_dim = param_last_dim  # No TP multiplier for column-parallel
-                                    else:
-                                        expected_blocks_dim = param_last_dim * tp_size  # Row-parallel or full scale
-                                    
-                                    actual_dim = loaded_weight.shape[-1]
-                                    
-                                    # Apply conversion if dimension mismatch detected
-                                    conversion_applied = False
-                                    if actual_dim < expected_blocks_dim and (expected_blocks_dim % actual_dim == 0):
-                                        # Expansion needed (e.g., different block sizes: 128 -> 32)
-                                        expand_ratio = expected_blocks_dim // actual_dim
-                                        if len(loaded_weight.shape) == 2:
-                                            loaded_weight = loaded_weight.repeat_interleave(expand_ratio, dim=1).contiguous()
-                                        elif len(loaded_weight.shape) == 3:
-                                            loaded_weight = loaded_weight.repeat_interleave(expand_ratio, dim=2).contiguous()
-                                        conversion_applied = True
-                                    elif actual_dim == expected_blocks_dim * block_size:
-                                        # Per-element to per-block conversion
-                                        if len(loaded_weight.shape) == 2:
-                                            loaded_weight = loaded_weight[:, ::block_size].contiguous()
-                                        elif len(loaded_weight.shape) == 3:
-                                            loaded_weight = loaded_weight[:, :, ::block_size].contiguous()
-                                        conversion_applied = True
-                                    elif actual_dim == expected_blocks_dim * 2:
-                                        # 2x dimension mismatch
-                                        if len(loaded_weight.shape) == 2:
-                                            loaded_weight = loaded_weight[:, ::2].contiguous()
-                                        elif len(loaded_weight.shape) == 3:
-                                            loaded_weight = loaded_weight[:, :, ::2].contiguous()
-                                        conversion_applied = True
-                                    elif actual_dim > expected_blocks_dim and (actual_dim % expected_blocks_dim == 0):
-                                        # Generic N-x dimension mismatch
-                                        ratio = actual_dim // expected_blocks_dim
-                                        if len(loaded_weight.shape) == 2:
-                                            loaded_weight = loaded_weight[:, ::ratio].contiguous()
-                                        elif len(loaded_weight.shape) == 3:
-                                            loaded_weight = loaded_weight[:, :, ::ratio].contiguous()
-                                        conversion_applied = True
-                        
-                        # Handle 2D scales that need to be reduced to 1D
-                        # This applies to both shared_experts and other layers (e.g., kv_b_proj)
-                        if "scale" in name and loaded_weight.ndim == 2 and param.data.ndim == 1:
-                            # Multiple cases:
-                            # 0. [num_blocks, hidden_dim] - blocked scale format, needs flattening + expansion
-                            # 1. [channels, num_shared_experts] - per-expert scales, slice or take first
-                            # 2. [out_channels, in_channels] - full 2D block scales, extract diagonal or take mean
-                            # 3. Checkpoint has per-expert scales and param name has expert ID
-                            
-                            loaded_numel = loaded_weight.shape[0] * loaded_weight.shape[1]
-                            param_numel = param.data.shape[0]
-                            
-                            # Check if this is a blocked/grouped scale format (e.g., [56, 16] -> [7168])
-                            if loaded_numel < param_numel and (param_numel % loaded_numel == 0):
-                                # Case 0: Blocked scale - flatten and expand
-                                group_size = param_numel // loaded_numel
-                                logger.warning_once(
-                                    f"[SHARED EXPERT SCALE] Expanding blocked scale for {name}: "
-                                    f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape}, "
-                                    f"group_size={group_size}"
-                                )
-                                loaded_weight = loaded_weight.flatten().repeat_interleave(group_size).contiguous()
-                                # After expansion, directly copy if shapes match
-                                if loaded_weight.shape == param.data.shape:
-                                    param.data.copy_(loaded_weight)
-                                    continue
-                            else:
-                                # Extract expert ID from the parameter name if it exists
-                                expert_id = None
-                                name_parts = name.split('.')
-                                for i, part in enumerate(name_parts):
-                                    if part == 'experts' and i + 1 < len(name_parts) and name_parts[i + 1].isdigit():
-                                        expert_id = int(name_parts[i + 1])
-                                        break
-                                
-                                if expert_id is not None and expert_id < loaded_weight.shape[1]:
-                                    # Case 3: Slice to get single expert's scale
-                                    logger.warning_once(
-                                        f"[SHARED EXPERT SCALE] Slicing 2D scale for {name}: "
-                                        f"loaded_weight.shape={loaded_weight.shape}, "
-                                        f"param.data.shape={param.data.shape}, expert_id={expert_id}"
-                                    )
-                                    loaded_weight = loaded_weight[:, expert_id].contiguous()
-                                elif loaded_weight.shape[0] == param.data.shape[0] and loaded_weight.shape[1] == loaded_weight.shape[0]:
-                                    # Case 2: Square matrix [N, N] - likely diagonal or per-block scales
-                                    # For row-parallel down_proj, take diagonal (output channel scales)
-                                    logger.warning_once(
-                                        f"[SHARED EXPERT SCALE] Taking diagonal of square 2D scale for {name}: "
-                                        f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape}"
-                                    )
-                                    loaded_weight = torch.diagonal(loaded_weight).contiguous()
-                                    # After extracting diagonal, if shapes match exactly, directly copy
-                                    # to avoid incorrect TP sharding logic
-                                    if loaded_weight.shape == param.data.shape:
-                                        param.data.copy_(loaded_weight)
-                                        continue
-                                elif loaded_weight.shape[0] == param.data.shape[0] and loaded_weight.shape[1] <= 8:
-                                    # Case 1: [channels, num_shared_experts] where num_shared_experts is small
-                                    # Take the first expert's scale as representative
-                                    logger.warning_once(
-                                        f"[SHARED EXPERT SCALE] Taking first expert scale for merged shared_experts in {name}: "
-                                        f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape}"
-                                    )
-                                    loaded_weight = loaded_weight[:, 0].contiguous()
-                        
-                        # Debug: Log shape before TP sharding for shared_experts
-                        if "shared_experts" in name and "weight" in name and not "scale" in name:
-                            logger.warning_once(
-                                f"[DEBUG PRE-SHARD] Before TP sharding for {name}: "
-                                f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape}, "
-                                f"ndim={loaded_weight.ndim}"
-                            )
-                        
-                        # For scales/weights that match param shape exactly, directly copy
-                        # to avoid incorrect TP sharding logic
-                        if loaded_weight.shape == param.data.shape:
-                            param.data.copy_(loaded_weight)
-                        else:
-                            # For shared_experts weights, manually handle TP sharding before weight_loader
-                            if "shared_experts" in name and "weight" in name and not "scale" in name and loaded_weight.ndim == 2:
-                                tp_size = get_tensor_model_parallel_world_size()
-                                tp_rank = get_tensor_model_parallel_rank()
-                                
-                                # Debug: Log before sharding
-                                logger.warning_once(
-                                    f"[SHARED EXPERT PRE-SHARD] name={name}, "
-                                    f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape}, "
-                                    f"tp_rank={tp_rank}, tp_size={tp_size}"
-                                )
-                                
-                                # down_proj is row-parallel: shard dimension 1 (input)
-                                # gate_proj/up_proj are column-parallel: shard dimension 0 (output)
-                                if "down_proj" in name:
-                                    # Shard dimension 1
-                                    if loaded_weight.shape[1] == param.data.shape[1] * tp_size:
-                                        shard_size = param.data.shape[1]
-                                        start_idx = tp_rank * shard_size
-                                        loaded_weight = loaded_weight[:, start_idx:start_idx + shard_size].contiguous()
-                                        logger.warning_once(
-                                            f"[SHARED EXPERT TP] Sharded {name} dim1: "
-                                            f"tp_rank={tp_rank}, shard=[{start_idx}:{start_idx + shard_size}], "
-                                            f"result_shape={loaded_weight.shape}"
-                                        )
-                                elif "gate_proj" in name or "up_proj" in name:
-                                    # Shard dimension 0
-                                    if loaded_weight.shape[0] == param.data.shape[0] * tp_size:
-                                        shard_size = param.data.shape[0]
-                                        start_idx = tp_rank * shard_size
-                                        loaded_weight = loaded_weight[start_idx:start_idx + shard_size, :].contiguous()
-                                        logger.warning_once(
-                                            f"[SHARED EXPERT TP] Sharded {name} dim0: "
-                                            f"tp_rank={tp_rank}, shard=[{start_idx}:{start_idx + shard_size}], "
-                                            f"result_shape={loaded_weight.shape}"
-                                        )
-                            
-                            # After manual sharding, check if shapes now match
-                            if loaded_weight.shape == param.data.shape:
-                                param.data.copy_(loaded_weight)
-                            else:
-                                # Debug: Log before weight_loader call if shapes don't match
-                                logger.warning_once(
-                                    f"[DEBUG WEIGHT_LOADER] Calling weight_loader for {name}: "
-                                    f"loaded_weight.shape={loaded_weight.shape}, param.data.shape={param.data.shape}, "
-                                    f"weight_loader={getattr(param, 'weight_loader', default_weight_loader).__name__}"
-                                )
-                                weight_loader = getattr(
-                                    param, "weight_loader", default_weight_loader
-                                )
-                                weight_loader(param, loaded_weight)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 
