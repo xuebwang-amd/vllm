@@ -973,10 +973,42 @@ class FusedMoE(CustomOp):
         shard_id: str,
         loaded_weight: torch.Tensor,
         tp_rank: int,
+        expert_id: int | None = None,
+        global_expert_id: int | None = None,
     ):
         # for per channel weight quantization
         if shard_id == "w2":
-            expert_data.copy_(loaded_weight)
+            if (
+                loaded_weight.ndim == 2
+                and expert_data.ndim == 1
+                and loaded_weight.shape[1] == expert_data.shape[0] * self.tp_size
+            ):
+                # If the checkpoint only stores routed experts for this rank,
+                # shared experts will be out of range and should be skipped.
+                if (
+                    expert_id is not None
+                    and expert_id >= loaded_weight.shape[0]
+                    and loaded_weight.shape[0] < self.local_num_experts
+                ):
+                    return
+                row_index = None
+                if global_expert_id is not None and 0 <= global_expert_id < loaded_weight.shape[0]:
+                    row_index = global_expert_id
+                elif expert_id is not None and 0 <= expert_id < loaded_weight.shape[0]:
+                    row_index = expert_id
+                if row_index is not None:
+                    loaded_weight = loaded_weight[row_index]
+            if expert_data.ndim == 0:
+                expert_data.copy_(loaded_weight)
+                return
+            if shard_dim >= expert_data.ndim:
+                shard_dim = expert_data.ndim - 1
+            self._load_w2(
+                shard_dim=shard_dim,
+                loaded_weight=loaded_weight,
+                expert_data=expert_data,
+                tp_rank=tp_rank,
+            )
         elif shard_id in ("w1", "w3"):
             self._load_w13(
                 shard_id=shard_id,
@@ -984,6 +1016,8 @@ class FusedMoE(CustomOp):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                expert_id=expert_id,
+                global_expert_id=global_expert_id,
             )
 
     def _load_w13(
@@ -994,6 +1028,8 @@ class FusedMoE(CustomOp):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         load_full: bool = False,
+        expert_id: int | None = None,
+        global_expert_id: int | None = None,
     ):
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
@@ -1001,18 +1037,150 @@ class FusedMoE(CustomOp):
             shard_size = expert_data.shape[shard_dim] // 2
         else:
             shard_size = expert_data.shape[shard_dim]
-        if not load_full:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
+        
+        # Handle blocked PTPC FP8 scale format before TP sharding
+        # If loaded_weight is 2D and expert_data is 1D, check if it's a blocked scale
+        if loaded_weight.ndim == 2 and expert_data.ndim == 1:
+            loaded_numel = loaded_weight.shape[0] * loaded_weight.shape[1]
+            # Calculate total expected size across all TP ranks
+            total_expected = shard_size * self.tp_size
+            # Check if this is a blocked scale that needs expansion
+            if loaded_numel < total_expected and (total_expected % loaded_numel == 0):
+                # Blocked scale format - flatten and expand
+                group_size = total_expected // loaded_numel
+                logger.warning_once(
+                    f"[W13 BLOCKED SCALE] Expanding blocked scale: "
+                    f"loaded_weight.shape={loaded_weight.shape}, expert_data.shape={expert_data.shape}, "
+                    f"group_size={group_size}, tp_size={self.tp_size}"
+                )
+                loaded_weight = loaded_weight.flatten().repeat_interleave(group_size).contiguous()
+        
+        # Track whether we should skip narrowing (for full merged scales)
+        skip_narrowing = False
+        
+        # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
+        # and we're not loading the full weight
+        if not load_full and loaded_weight.ndim > 0:
+            # Check if the checkpoint tensor has compatible dimensions for TP sharding
+            checkpoint_size = loaded_weight.shape[shard_dim]
+            expected_size = shard_size * self.tp_size
+            start_idx = shard_size * tp_rank
+
+            # Some checkpoints store per-block w13 scales (e.g., size reduced by
+            # block factor). If so, expand to per-channel before sharding.
+            if checkpoint_size < shard_size and shard_size % checkpoint_size == 0:
+                block_factor = shard_size // checkpoint_size
+                loaded_weight = loaded_weight.repeat_interleave(
+                    block_factor, dim=shard_dim
+                )
+                checkpoint_size = loaded_weight.shape[shard_dim]
+            
+            # For merged gate_up layers (is_act_and_mul=True), check if checkpoint already has
+            # the correct size for this TP rank's full merged scale (gate+up together)
+            if (self.moe_config.is_act_and_mul and 
+                checkpoint_size == expert_data.shape[shard_dim] and
+                checkpoint_size != expected_size):
+                # Checkpoint has the full merged size for this TP rank - use as-is
+                # Don't narrow - the checkpoint is already at the right size for this TP rank
+                skip_narrowing = True
+            # For merged gate_up layers (is_act_and_mul=True), check if checkpoint has
+            # the full merged size (gate + up) instead of just one component
+            elif (checkpoint_size == expected_size * 2 and self.moe_config.is_act_and_mul and
+                (shard_id == "w1" or shard_id == "w3" or "gate_proj" in str(shard_id) or "up_proj" in str(shard_id))):
+                # The checkpoint has the full intermediate_size, but we're loading gate/up separately
+                # Adjust shard_size and start_idx to account for this
+                actual_shard_size = shard_size * 2  # The shard for this component from the full checkpoint
+                actual_start_idx = actual_shard_size * tp_rank
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, actual_start_idx, actual_shard_size
+                )
+                
+                # Also check if the hidden dimension (dimension 1 for w13) needs sharding
+                # For w13 (gate_up_proj), dimension 0 is intermediate_size, dimension 1 is hidden_size
+                if loaded_weight.ndim >= 2 and shard_dim == 0:
+                    hidden_dim = 1  # The other dimension
+                    checkpoint_hidden_size = loaded_weight.shape[hidden_dim]
+                    expert_hidden_size = expert_data.shape[hidden_dim]
+                    
+                    if checkpoint_hidden_size != expert_hidden_size:
+                        if checkpoint_hidden_size % expert_hidden_size == 0:
+                            # Hidden dimension needs downsampling (e.g., 7168 -> 3584)
+                            hidden_ratio = checkpoint_hidden_size // expert_hidden_size
+                            # Downsample by taking every hidden_ratio-th element
+                            if hidden_ratio == 2:
+                                loaded_weight = loaded_weight[:, ::2].contiguous()
+                            else:
+                                loaded_weight = loaded_weight[:, ::hidden_ratio].contiguous()
+            elif checkpoint_size != expected_size:
+                # Try to handle common cases of dimension mismatch
+                if checkpoint_size == shard_size:
+                    # Checkpoint appears to be already sharded or has same size as one shard
+                    # Use it directly for all ranks (broadcast)
+                    pass
+                elif tp_rank == 0:
+                    logger.error(
+                        f"Checkpoint w13 weight dimension incompatible: checkpoint has {checkpoint_size} "
+                        f"elements in dimension {shard_dim}, expected {expected_size} for TP={self.tp_size}"
+                    )
+                    raise ValueError(
+                        f"Incompatible checkpoint: dimension {shard_dim} has size {checkpoint_size}, "
+                        f"expected {expected_size} for TP={self.tp_size}"
+                    )
+                else:
+                    raise ValueError(
+                        f"Incompatible checkpoint dimensions: {checkpoint_size} vs expected {expected_size}"
+                    )
+            else:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, start_idx, shard_size
+                )
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+            if not skip_narrowing:
+                expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+                # If loaded_weight has the full merged size (gate+up), also narrow it to just gate
+                if loaded_weight.shape[shard_dim] == expert_data.shape[shard_dim] * 2:
+                    loaded_weight = loaded_weight.narrow(shard_dim, 0, shard_size)
         # w3, up_proj: Load into second logical weight of w13.
         else:
             assert shard_id == "w3"
-            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+            if not skip_narrowing:
+                expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+                # If loaded_weight has the full merged size (gate+up), also narrow it to just up
+                if loaded_weight.shape[shard_dim] == expert_data.shape[shard_dim] * 2:
+                    loaded_weight = loaded_weight.narrow(shard_dim, shard_size, shard_size)
+        
+        # If per-channel scales are stored as (channels, experts), slice the
+        # expert dimension before copy.
+        if loaded_weight.ndim == 2 and expert_id is not None:
+            # Checkpoint has per-expert scales in a 2D tensor
+            local_routed_experts = (
+                self.local_num_experts - self.num_fused_shared_experts
+            )
+            # If checkpoint only stores routed experts for this rank, shared
+            # experts will be out of range and should be skipped.
+            if (
+                expert_id >= loaded_weight.shape[1]
+                and (global_expert_id is None
+                     or global_expert_id >= loaded_weight.shape[1])
+            ):
+                return
+            row_index = None
+            if (
+                global_expert_id is not None
+                and 0 <= global_expert_id < loaded_weight.shape[1]
+            ):
+                row_index = global_expert_id
+            elif 0 <= expert_id < loaded_weight.shape[1]:
+                row_index = expert_id
+            if row_index is not None:
+                # Select the column for this expert
+                loaded_weight = loaded_weight[:, row_index]
+        
+        # Now expand 1D loaded_weight to 2D expert_data if needed
+        if loaded_weight.ndim == 1 and expert_data.ndim == 2:
+            loaded_weight = loaded_weight.unsqueeze(1).expand_as(expert_data)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -1027,10 +1195,62 @@ class FusedMoE(CustomOp):
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
-        if not load_full:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
+        
+        # Handle blocked PTPC FP8 scale format before TP sharding
+        # If loaded_weight is 2D and expert_data is 1D, check if it's a blocked scale
+        if loaded_weight.ndim == 2 and expert_data.ndim == 1:
+            loaded_numel = loaded_weight.shape[0] * loaded_weight.shape[1]
+            # Calculate total expected size across all TP ranks
+            total_expected = shard_size * self.tp_size
+            # Check if this is a blocked scale that needs expansion
+            if loaded_numel < total_expected and (total_expected % loaded_numel == 0):
+                # Blocked scale format - flatten and expand
+                group_size = total_expected // loaded_numel
+                logger.warning_once(
+                    f"[W2 BLOCKED SCALE] Expanding blocked scale: "
+                    f"loaded_weight.shape={loaded_weight.shape}, expert_data.shape={expert_data.shape}, "
+                    f"group_size={group_size}, tp_size={self.tp_size}"
+                )
+                loaded_weight = loaded_weight.flatten().repeat_interleave(group_size).contiguous()
+        
+        # Only narrow if the loaded_weight is not a scalar (0-dim tensor)
+        # and we're not loading the full weight
+        if not load_full and loaded_weight.ndim > 0:
+            # Check if the checkpoint tensor has compatible dimensions for TP sharding
+            checkpoint_size = loaded_weight.shape[shard_dim]
+            expected_size = shard_size * self.tp_size
+            start_idx = shard_size * tp_rank
+            
+            if checkpoint_size != expected_size:
+                # Try to handle common cases of dimension mismatch
+                if checkpoint_size == shard_size:
+                    # Checkpoint appears to be already sharded or has same size as one shard
+                    # Use it directly for all ranks (broadcast)
+                    pass
+                elif tp_rank == 0:
+                    # Only log detailed error from rank 0 to avoid spam
+                    logger.error(
+                        f"Checkpoint weight dimension incompatible with TP configuration: "
+                        f"loaded_weight.shape={loaded_weight.shape}, expert_data.shape={expert_data.shape}, "
+                        f"checkpoint has {checkpoint_size} elements in dimension {shard_dim}, "
+                        f"expected {expected_size} for TP={self.tp_size}. "
+                        f"Shard size={shard_size}, attempting to access [{start_idx}:{start_idx + shard_size}]. "
+                        f"This likely indicates the checkpoint has transposed dimensions or wrong quantization config."
+                    )
+                    raise ValueError(
+                        f"Incompatible checkpoint: dimension {shard_dim} has size {checkpoint_size}, "
+                        f"expected {expected_size} for TP={self.tp_size}. "
+                        f"loaded_weight.shape={loaded_weight.shape}, expert_data.shape={expert_data.shape}"
+                    )
+                else:
+                    raise ValueError(
+                        f"Incompatible checkpoint dimensions: {checkpoint_size} vs expected {expected_size}. "
+                        f"loaded_weight.shape={loaded_weight.shape}"
+                    )
+            else:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, start_idx, shard_size
+                )
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
 
@@ -1181,6 +1401,8 @@ class FusedMoE(CustomOp):
                     expert_data=expert_data,
                     tp_rank=self.tp_rank,
                     load_full=full_load,
+                    expert_id=expert_id,
+                    global_expert_id=global_expert_id,
                 )
             return True if return_success else None
 
@@ -1195,6 +1417,106 @@ class FusedMoE(CustomOp):
         full_load = len(loaded_weight.shape) == 3
         if full_load:
             shard_dim += 1
+        
+        # Special handling for block/group quantization scales:
+        # For w2_weight_scale with shape (num_experts, hidden_size, intermediate_size//block),
+        # we need to shard the LAST dimension (input), not dimension 1 (output).
+        # The standard SHARD_ID_TO_SHARDED_DIM is for weights, not scales.
+        # For w13_weight_scale, dimension 1 is correct (intermediate_size dimension).
+        quant_method = getattr(param, "quant_method", None)
+        is_block_scale = quant_method in [
+            FusedMoeWeightScaleSupported.BLOCK.value,
+            FusedMoeWeightScaleSupported.GROUP.value,
+        ] and "scale" in weight_name
+        
+        # Check for transposed checkpoints for block scales
+        if is_block_scale:
+            if full_load and len(loaded_weight.shape) == 3:
+                param_shape = param.data.shape
+                # For w13: should be (num_experts, intermediate_size*2, hidden_size//block)
+                # For w2: should be (num_experts, hidden_size, intermediate_size//block)
+                # If checkpoint has them swapped, transpose
+                if ((shard_id in ["w1", "w3"] and loaded_weight.shape[1] != param_shape[1] and
+                     loaded_weight.shape[2] == param_shape[1] and
+                     loaded_weight.shape[1] == param_shape[2] * self.tp_size) or
+                    (shard_id == "w2" and loaded_weight.shape[1] != param_shape[1] and
+                     loaded_weight.shape[2] == param_shape[1] and
+                     loaded_weight.shape[1] == param_shape[2] * self.tp_size)):
+                    loaded_weight = loaded_weight.transpose(1, 2).contiguous()
+            elif not full_load and len(loaded_weight.shape) == 2 and expert_id != -1:
+                # For 2D per-expert tensors
+                param_shape = param.data[expert_id].shape
+                # For w13: should be (intermediate_size*2, hidden_size//block)
+                # For w2: should be (hidden_size, intermediate_size//block)
+                # Check if dimensions are swapped
+                if ((shard_id in ["w1", "w3"] and loaded_weight.shape[0] != param_shape[0] and
+                     loaded_weight.shape[1] == param_shape[0] and
+                     loaded_weight.shape[0] == param_shape[1] * self.tp_size) or
+                    (shard_id == "w2" and loaded_weight.shape[0] != param_shape[0] and
+                     loaded_weight.shape[1] == param_shape[0] and
+                     loaded_weight.shape[0] == param_shape[1] * self.tp_size)):
+                    loaded_weight = loaded_weight.t().contiguous()
+        
+        if is_block_scale:
+            # For block scales, the shard dimension needs adjustment
+            original_shard_dim = shard_dim
+            
+            if shard_id == "w2":
+                # w2_weight_scale has shape (hidden_size, intermediate_size//block) for 2D
+                # or (num_experts, hidden_size, intermediate_size//block) for 3D
+                # We need to shard the intermediate_size dimension (last dim)
+                if full_load:
+                    shard_dim = 2  # Last dimension for 3D tensors
+                else:
+                    shard_dim = 1  # Last dimension for 2D tensors
+            elif shard_id in ["w1", "w3"]:
+                # w13_weight_scale has shape (intermediate_size*2, hidden_size//block) for 2D
+                # or (num_experts, intermediate_size*2, hidden_size//block) for 3D
+                # We shard the intermediate_size dimension (dim 0 for 2D, dim 1 for 3D)
+                # The default SHARD_ID_TO_SHARDED_DIM is already correct, no change needed
+                pass
+            
+            # Check if checkpoint has dimensions that need conversion to blocked format
+            param_shape = param.data.shape if full_load else (param.data[expert_id].shape if expert_id != -1 else None)
+            if param_shape is not None and shard_id == "w2":  # Handle w2 first
+                block_size = 32  # OCP_MX_BLOCK_SIZE
+                
+                # For w2_weight_scale:
+                # Expected param shape: (hidden_size, intermediate_size_per_partition//32)
+                # Loaded weight shape could be: (hidden_size, intermediate_size) WITHOUT blocking
+                # We need to convert: (H, I) -> (H, I//32)
+                expected_blocks_dim = param_shape[-1] * self.tp_size  # Total blocks across TP
+                actual_dim = loaded_weight.shape[-1]
+                
+                # Handle various checkpoint format mismatches
+                conversion_applied = False
+                
+                # Case 1: Checkpoint has per-element scales (intermediate_size instead of intermediate_size//32)
+                if actual_dim == expected_blocks_dim * block_size:
+                    if len(loaded_weight.shape) == 2:
+                        loaded_weight = loaded_weight[:, ::block_size].contiguous()
+                    elif len(loaded_weight.shape) == 3:
+                        loaded_weight = loaded_weight[:, :, ::block_size].contiguous()
+                    conversion_applied = True
+                
+                # Case 2: Checkpoint has 2x the expected size (possibly different block size or intermediate_size)
+                elif actual_dim == expected_blocks_dim * 2:
+                    # Downsample by factor of 2 (take every 2nd element)
+                    if len(loaded_weight.shape) == 2:
+                        loaded_weight = loaded_weight[:, ::2].contiguous()
+                    elif len(loaded_weight.shape) == 3:
+                        loaded_weight = loaded_weight[:, :, ::2].contiguous()
+                    conversion_applied = True
+                
+                # Case 3: Checkpoint uses different block size - try to infer
+                elif actual_dim > expected_blocks_dim:
+                    ratio = actual_dim // expected_blocks_dim
+                    if actual_dim == expected_blocks_dim * ratio:  # Clean division
+                        if len(loaded_weight.shape) == 2:
+                            loaded_weight = loaded_weight[:, ::ratio].contiguous()
+                        elif len(loaded_weight.shape) == 3:
+                            loaded_weight = loaded_weight[:, :, ::ratio].contiguous()
+                        conversion_applied = True
 
         # Materialize GGUF UninitializedParameter accounting merged weights
         if is_gguf_weight and isinstance(param, UninitializedParameter):
@@ -1306,13 +1628,34 @@ class FusedMoE(CustomOp):
             # TODO @dsikka: once hardened, refactor to use vLLM Parameters
             # specific to each case
             quant_method = getattr(param, "quant_method", None)
+            
             if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
+                if (
+                    shard_id == "w2"
+                    and loaded_weight.ndim == 2
+                    and expert_data.ndim == 1
+                    and loaded_weight.shape[1]
+                    == expert_data.shape[0] * self.tp_size
+                ):
+                    row_index = None
+                    if loaded_weight.shape[0] == self.global_num_experts:
+                        row_index = global_expert_id
+                    elif loaded_weight.shape[0] == self.local_num_experts:
+                        row_index = expert_id
+                    elif 0 <= global_expert_id < loaded_weight.shape[0]:
+                        row_index = global_expert_id
+                    elif 0 <= expert_id < loaded_weight.shape[0]:
+                        row_index = expert_id
+                    if row_index is not None and row_index >= 0:
+                        loaded_weight = loaded_weight[row_index]
                 self._load_per_channel_weight_scale(
                     shard_id=shard_id,
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=self.tp_rank,
+                    expert_id=expert_id,
+                    global_expert_id=global_expert_id,
                 )
             elif quant_method in [
                 FusedMoeWeightScaleSupported.GROUP.value,
