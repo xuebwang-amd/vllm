@@ -1480,11 +1480,32 @@ class DeepseekV2ForCausalLM(
                         if is_pp_missing_parameter(name, self):
                             continue
 
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
+                        # Handle KV cache scale parameters for quantized models
+                        if self.quant_config is not None and (
+                            scale_name := self.quant_config.get_cache_scale(name)
+                        ):
+                            # Check if the scale name exists in params_dict
+                            if scale_name in params_dict:
+                                param = params_dict[scale_name]
+                                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                                if loaded_weight.numel() != 1:
+                                    raise ValueError(
+                                        f"KV cache scale '{scale_name}' is expected to be a scalar, "
+                                        f"but got a tensor of shape {loaded_weight.shape}."
+                                    )
+                                weight_loader(param, loaded_weight)
+                            else:
+                                # Scale name not found in params_dict, skip this weight
+                                continue
+                        elif name in params_dict:
+                            param = params_dict[name]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, loaded_weight)
+                        else:
+                            # Parameter not found in params_dict, skip this weight
+                            continue
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 
