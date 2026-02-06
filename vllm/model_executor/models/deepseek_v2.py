@@ -1506,7 +1506,7 @@ class DeepseekV2ForCausalLM(
                         else:
                             # Parameter not found in params_dict, skip this weight
                             continue
-            if not is_fusion_moe_shared_experts_layer:
+            if name is not None and not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 
         return loaded_params
