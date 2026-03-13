@@ -16,6 +16,7 @@ class MoEActivation(Enum):
     SILU = "silu"
     GELU = "gelu"
     RELU2 = "relu2"
+    SWIGLU = "swiglu"
     SWIGLUOAI = "swigluoai"
     SWIGLUSTEP = "swiglustep"
 
@@ -64,6 +65,7 @@ class MoEActivation(Enum):
 _CUSTOM_OP_NAMES: dict[MoEActivation, str] = {
     MoEActivation.SILU: "silu_and_mul",
     MoEActivation.GELU: "gelu_and_mul",
+    MoEActivation.SWIGLU: "silu_and_mul",  # SwiGLU = gate * SiLU(up), same as SILU
     MoEActivation.SWIGLUOAI: "swigluoai_and_mul",
     MoEActivation.SWIGLUSTEP: "swiglustep_and_mul",
     MoEActivation.RELU2: "relu2",
@@ -75,6 +77,7 @@ _CUSTOM_OP_NAMES: dict[MoEActivation, str] = {
 _WITHOUT_MUL: dict[MoEActivation, MoEActivation] = {
     MoEActivation.SILU: MoEActivation.SILU_NO_MUL,
     MoEActivation.GELU: MoEActivation.GELU_NO_MUL,
+    MoEActivation.SWIGLU: MoEActivation.SILU_NO_MUL,  # SwiGLU without mul = SiLU
     MoEActivation.RELU2: MoEActivation.RELU2_NO_MUL,
 }
 
@@ -111,7 +114,8 @@ def apply_moe_activation(
         )
 
     # Activations with gated multiplication (gate × activation(up))
-    if activation == MoEActivation.SILU:
+    if activation in (MoEActivation.SILU, MoEActivation.SWIGLU):
+        # SwiGLU = gate * SiLU(up), same as SILU
         torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:
         torch.ops._C.gelu_and_mul(output, input)

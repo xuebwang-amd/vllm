@@ -372,8 +372,9 @@ class MoeWNA16Method(FusedMoEMethodBase):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.fused_moe import fused_experts
 
-        assert layer.activation == MoEActivation.SILU, (
-            f"Only SiLU activation is supported, not {layer.activation}."
+        # SwiGLU = gate * SiLU(up), same computation as SILU (silu_and_mul)
+        assert layer.activation in (MoEActivation.SILU, MoEActivation.SWIGLU), (
+            f"Only SiLU/SwiGLU activation is supported, not {layer.activation}."
         )
 
         return fused_experts(
