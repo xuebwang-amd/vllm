@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import enum
+import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -28,7 +29,18 @@ try:
         LMCacheMPWorkerAdapter,
         LoadStoreOp,
     )
+
+    try:
+        from lmcache.v1.multiprocess.custom_types import RequestAllocationRecord
+    except ImportError:
+        from lmcache.v1.multiprocess.custom_types import (
+            BlockAllocationRecord as RequestAllocationRecord,
+        )
 except ImportError:
+    from lmcache.v1.multiprocess.custom_types import (
+        BlockAllocationRecord as RequestAllocationRecord,
+    )
+
     from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration import (
         LMCacheMPSchedulerAdapter,
         LMCacheMPWorkerAdapter,
@@ -50,6 +62,12 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+
+def _adapter_accepts_tp_size() -> bool:
+    """Check if the imported adapter accepts tp_size."""
+    sig = inspect.signature(LMCacheMPSchedulerAdapter.__init__)
+    return "tp_size" in sig.parameters
 
 
 # Helper functions
@@ -94,13 +112,25 @@ def extract_world_size_and_kv_rank(
 
 
 def create_scheduler_adapter(
-    server_url: str, zmq_context: zmq.Context, vllm_config: VllmConfig
+    server_url: str,
+    zmq_context: zmq.Context,
+    vllm_config: VllmConfig,
+    mq_timeout: float,
+    heartbeat_interval: float,
 ) -> LMCacheMPSchedulerAdapter:
     world_size, kv_rank = extract_world_size_and_kv_rank(
         vllm_config.parallel_config.world_size,
         vllm_config.parallel_config.rank,
         vllm_config,
     )
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+    # Pass tp_size only when the adapter accepts it so that
+    # a newer vllm can still work with an older LMCache.
+    kwargs: dict[str, Any] = {}
+    if _adapter_accepts_tp_size():
+        kwargs["tp_size"] = tp_size
+
     return LMCacheMPSchedulerAdapter(
         server_url,
         zmq_context,
@@ -108,11 +138,18 @@ def create_scheduler_adapter(
         world_size,
         kv_rank,
         vllm_config.cache_config.block_size,
+        mq_timeout=mq_timeout,
+        heartbeat_interval=heartbeat_interval,
+        **kwargs,
     )
 
 
 def create_worker_adapter(
-    server_url: str, zmq_context: zmq.Context, vllm_config: VllmConfig
+    server_url: str,
+    zmq_context: zmq.Context,
+    vllm_config: VllmConfig,
+    mq_timeout: float,
+    heartbeat_interval: float,
 ) -> LMCacheMPWorkerAdapter:
     world_size, kv_rank = extract_world_size_and_kv_rank(
         vllm_config.parallel_config.world_size,
@@ -126,6 +163,8 @@ def create_worker_adapter(
         world_size,
         kv_rank,
         vllm_config.cache_config.block_size,
+        mq_timeout=mq_timeout,
+        heartbeat_interval=heartbeat_interval,
     )
 
 
@@ -397,6 +436,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
     Extra configs (kv_transfer_config.extra_config):
     - lmcache.mp.host: the host of the LMCache server.
     - lmcache.mp.port: the port of the LMCache server.
+    - lmcache.mp.mq_timeout: timeout (seconds) for message queue requests.
+    - lmcache.mp.heartbeat_interval: interval (seconds) between server
+      heartbeat pings.
     """
 
     def __init__(
@@ -414,17 +456,35 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         server_port = vllm_config.kv_transfer_config.get_from_extra_config(
             "lmcache.mp.port", 5555
         )
+        mq_timeout = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.mq_timeout", 300.0
+            )
+        )
+        heartbeat_interval = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.heartbeat_interval", 10.0
+            )
+        )
 
         server_url = f"{server_host}:{server_port}"
         zmq_context = zmq.Context.instance()
         if self.role == KVConnectorRole.SCHEDULER:
             self.scheduler_adapter = create_scheduler_adapter(
-                server_url, zmq_context, vllm_config
+                server_url,
+                zmq_context,
+                vllm_config,
+                mq_timeout,
+                heartbeat_interval,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
         elif self.role == KVConnectorRole.WORKER:
             self.worker_adapter = create_worker_adapter(
-                server_url, zmq_context, vllm_config
+                server_url,
+                zmq_context,
+                vllm_config,
+                mq_timeout,
+                heartbeat_interval,
             )
         else:
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")
@@ -600,8 +660,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             - Sync loading: failed blocks should be reported in the forward
               pass in which they are detected.
         """
-        # TODO: add error tracking
-        return set()
+        return self.worker_adapter.get_block_ids_with_load_errors()
 
     def shutdown(self):
         """
@@ -789,6 +848,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         if len(metadata) > 0:
             logger.debug("Final connector metadata: %s", metadata)
 
+        # Report block allocation deltas to LMCache for observability
+        self._report_block_allocation_deltas(scheduler_output)
+
         return metadata
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -958,6 +1020,64 @@ class LMCacheMPConnector(KVConnectorBase_V1):
 
             if r_meta is not None:
                 metadata.add_request_metadata(r_meta)
+
+    def _report_block_allocation_deltas(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Gather per-request block allocation deltas and report to LMCache.
+
+        For new requests: all allocated_block_ids and token_ids are new.
+        For cached requests: only newly appended block_ids and token_ids.
+        """
+        records: list[RequestAllocationRecord] = []
+
+        # New requests: send all tokens covering all allocated blocks so
+        # the L0 metrics subscriber can correctly map each block to its
+        # actual token content (not just the newly-scheduled slice).
+        for new_request in scheduler_output.scheduled_new_reqs:
+            tracker = self.request_trackers.get(new_request.req_id)
+            if tracker is None:
+                continue
+            num_blocks = len(tracker.allocated_block_ids)
+            total_tokens = num_blocks * self.vllm_block_size
+            records.append(
+                RequestAllocationRecord(
+                    req_id=new_request.req_id,
+                    new_block_ids=list(tracker.allocated_block_ids),
+                    new_token_ids=list(tracker.all_token_ids[:total_tokens]),
+                )
+            )
+
+        # Cached requests: only the newly added blocks and their full
+        # token content.  We send all tokens covered by the new blocks
+        # (not just the tokens scheduled this step) so the L0 subscriber
+        # can correctly identify block content.
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for idx, request_id in enumerate(cached_reqs.req_ids):
+            new_block_ids = reformat_block_ids(cached_reqs.new_block_ids[idx])
+            if not new_block_ids:
+                continue
+            tracker = self.request_trackers.get(request_id)
+            if tracker is None:
+                continue
+            # The new blocks sit at the end of the request's block list.
+            # Compute the token range they cover.
+            total_blocks = len(tracker.allocated_block_ids)
+            num_new_blocks = len(new_block_ids)
+            start_token = (total_blocks - num_new_blocks) * self.vllm_block_size
+            end_token = total_blocks * self.vllm_block_size
+            new_token_ids = list(tracker.all_token_ids[start_token:end_token])
+            records.append(
+                RequestAllocationRecord(
+                    req_id=request_id,
+                    new_block_ids=new_block_ids,
+                    new_token_ids=new_token_ids,
+                )
+            )
+
+        if records:
+            self.scheduler_adapter.report_block_allocations(records)
 
     def _get_request_tracker(self, request_id: str) -> LMCacheMPRequestTracker:
         assert request_id in self.request_trackers, (
