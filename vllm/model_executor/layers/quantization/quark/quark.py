@@ -83,11 +83,13 @@ class QuarkConfig(QuantizationConfig):
 
         quant_config = getattr(hf_config, "quantization_config", None)
         if quant_config is not None:
-            quant_dtype = (
-                quant_config.get("global_quant_config", {})
-                .get("weight", {})
-                .get("dtype")
+            weight_config = quant_config.get("global_quant_config", {}).get(
+                "weight", {}
             )
+            if isinstance(weight_config, list):
+                quant_dtype = weight_config[0].get("dtype") if weight_config else None
+            else:
+                quant_dtype = weight_config.get("dtype")
             if quant_dtype == "fp4":
                 self.dynamic_mxfp4_quant = True
 
