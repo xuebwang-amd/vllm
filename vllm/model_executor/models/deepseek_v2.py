@@ -30,7 +30,7 @@ from itertools import islice
 
 import torch
 from torch import nn
-from transformers import DeepseekV2Config, DeepseekV3Config
+from transformers import DeepseekV2Config, DeepseekV3Config, PretrainedConfig
 
 import vllm._custom_ops as ops
 import vllm.envs as envs
@@ -610,6 +610,45 @@ class DeepseekV2Attention(nn.Module):
         return output
 
 
+# DSA checkpoints declare their per-layer indexer layout as `indexer_types`:
+# a `"full"` layer runs its own indexer, a `"shared"` layer reuses the top-k
+# indices the previous full layer wrote into the shared buffer.
+_SHARED_INDEXER_TYPES = frozenset({"shared", "S"})
+
+
+def get_dsa_indexer_skip_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether ``layer_id`` reuses an earlier layer's top-k indices.
+
+    ``indexer_types`` is the layout the checkpoint actually ships and the only
+    one that survives layer pruning or merging, so it wins. ``transformers``
+    synthesises it from ``index_topk_pattern``/``index_topk_freq`` when the
+    checkpoint omits it -- and releases before 5.14 consume those two fields
+    while doing so -- hence the fallbacks, which also cover the DSA families
+    that declare none of these (DeepSeek V3.2/V4, LongCat, Kimi: all layers
+    full).
+
+    Args:
+        config: The model config.
+        layer_id: Absolute decoder layer index.
+
+    Returns:
+        True if the layer must not build an indexer of its own.
+    """
+    layer_types = getattr(config, "indexer_types", None) or getattr(
+        config, "index_topk_pattern", None
+    )
+    if layer_types is not None:
+        # The declared layout covers backbone layers only; MTP/nextn indices
+        # fall past its end and are handled by the caller.
+        if 0 <= layer_id < len(layer_types):
+            return layer_types[layer_id] in _SHARED_INDEXER_TYPES
+        return False
+
+    freq = getattr(config, "index_topk_freq", 1)
+    offset = getattr(config, "index_skip_topk_offset", 2)
+    return max(layer_id - offset + 1, 0) % freq != 0
+
+
 class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
     def __init__(
         self, head_dim: int, dtype: torch.dtype, prefix: str, cache_config: CacheConfig
@@ -1093,20 +1132,10 @@ class DeepseekV2MLAAttention(nn.Module):
         _skip_topk = False
         is_mtp_layer = False
         if self.is_v32:
-            _index_topk_freq = getattr(config, "index_topk_freq", 1)
-            _index_topk_pattern = getattr(config, "index_topk_pattern", None)
-            _index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
             layer_id = extract_layer_index(prefix)
+            _skip_topk = get_dsa_indexer_skip_topk(config, layer_id)
 
-            if _index_topk_pattern is None:
-                _skip_topk = (
-                    max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq
-                    != 0
-                )
-            elif 0 <= layer_id < len(_index_topk_pattern):
-                _skip_topk = _index_topk_pattern[layer_id] == "S"
-
-            # The skip pattern only governs backbone layers. MTP/nextn
+            # The declared layout only governs backbone layers. MTP/nextn
             # layers (layer_id >= num_hidden_layers) always build a full
             # indexer: they compute indices at draft step 0 and toggle
             # at runtime via set_skip_topk

@@ -36,6 +36,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
 from vllm.model_executor.models.deepseek_v2 import (
     DeepSeekV2FusedQkvAProjLinear,
     DeepseekV32IndexerCache,
+    get_dsa_indexer_skip_topk,
     yarn_get_mscale,
 )
 from vllm.model_executor.models.utils import extract_layer_index
@@ -213,17 +214,7 @@ class DeepseekV32Attention(MLAAttention):
             scaling = scaling * mscale * mscale
 
         layer_id = extract_layer_index(prefix)
-        index_topk_freq = getattr(config, "index_topk_freq", 1)
-        index_topk_pattern = getattr(config, "index_topk_pattern", None)
-        index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
-        if index_topk_pattern is None:
-            skip_topk = (
-                max(layer_id - index_skip_topk_offset + 1, 0) % index_topk_freq != 0
-            )
-        elif 0 <= layer_id < len(index_topk_pattern):
-            skip_topk = index_topk_pattern[layer_id] == "S"
-        else:
-            skip_topk = False
+        skip_topk = get_dsa_indexer_skip_topk(config, layer_id)
 
         num_hidden_layers = getattr(config, "num_hidden_layers", None)
         is_mtp_layer = num_hidden_layers is not None and layer_id >= num_hidden_layers
