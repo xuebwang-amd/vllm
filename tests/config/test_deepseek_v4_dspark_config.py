@@ -246,6 +246,7 @@ def test_dspark_draft_still_detected_by_name():
     "architecture,expected",
     [
         ("Qwen3DSparkModel", DSparkVariant.QWEN3),
+        ("Qwen3OmniDSparkModel", DSparkVariant.QWEN3_OMNI),
         ("Gemma4DSparkModel", DSparkVariant.GEMMA4),
         ("K3DSparkModel", DSparkVariant.K3),
     ],
@@ -254,6 +255,17 @@ def test_variant_resolved_from_declared_architecture(architecture, expected):
     config = PretrainedConfig(architectures=[architecture])
 
     assert DSparkVariant.from_config(config) is expected
+
+
+@pytest.mark.cpu_test
+def test_qwen3_omni_draft_is_auto_routed_to_dspark():
+    """Qwen3-Omni DSpark (#52560) declares its own architecture and must keep
+    auto-routing to dspark rather than falling through to DEEPSEEK_V4, whose
+    branch would rewrite `model_type` to `deepseek_v4`."""
+    config = PretrainedConfig(architectures=["Qwen3OmniDSparkModel"])
+
+    assert DSparkVariant.detected(config) is DSparkVariant.QWEN3_OMNI
+    assert _is_dspark_draft("some/qwen3-omni-draft", config)
 
 
 @pytest.mark.cpu_test
